@@ -94,6 +94,9 @@ class JQ implements \IteratorAggregate, \Countable
     protected static $inited = false;
     protected static $document;
     protected static $xpath;
+    public static $fn;
+    public static $fn_fallback;
+    protected static $FN_FUNC_NOT_FOUND;
     protected $jq = array();
     //hold the root element, prevent from gc
     protected $jq_root = array();
@@ -117,6 +120,9 @@ class JQ implements \IteratorAggregate, \Countable
     public static function init()
     {
         if (!self::$inited) {
+            self::$fn = new \stdClass();
+            self::$fn_fallback = [];
+            self::$FN_FUNC_NOT_FOUND = new \stdClass();
             list(self::$document) = self::createDocument();
             self::$xpath = new \DOMXPath(self::$document);
             self::$inited = true;
@@ -278,8 +284,12 @@ class JQ implements \IteratorAggregate, \Countable
                 $this->addone($jq2);
             }
         } elseif (\is_scalar($jq)) {
+            if ($jq === "") { //empty string will return no node
+                return;
+            }
             foreach (self::loadHTMLPart($jq) as $node) {
                 $this->jq[] = $node;
+                $this->jq_root[] = self::getRoot($node);
             }
         } elseif ($jq === NULL) {
         } else {
@@ -500,7 +510,7 @@ class JQ implements \IteratorAggregate, \Countable
                 } elseif ($node->tagName === "input" || $node->tagName === "option") {
                     $type = self::getAttribute($node, "type");
                     if ($type === "") {
-                        return null;
+                        return NULL;
                     }
                     return self::getAttribute($node, "value");
                 } elseif ($node->tagName === "select") {
@@ -1339,24 +1349,32 @@ class JQ implements \IteratorAggregate, \Countable
 
     /**
      * return new JQ() from ob_get_contents().
+     * if content is empty then return an empty JQ.
      * @param bool $trim remove blank before first '<' and after last '>'
      * @return \JQ
      */
     public static function jq_ob_get_contents($trim = true)
     {
-        $content = \ob_get_contents();
+        $content = self::trim(\ob_get_contents(), $trim);
+        if ($content === "") {
+            return new self();
+        }
         return new self($content);
     }
 
     /**
      * return new JQ() from ob_get_contents(), automatic close ob with ob_end_clean().
+     * if content is empty then return an empty JQ.
      * @param bool $trim remove blank before first '<' and after last '>'
      * @return \JQ
      */
     public static function jq_ob_end_clean($trim = true)
     {
-        $content = \ob_get_contents();
+        $content = self::trim(\ob_get_contents(), $trim);
         \ob_end_clean();
+        if ($content === "") {
+            return new self();
+        }
         return new self($content);
     }
 
@@ -1376,106 +1394,217 @@ class JQ implements \IteratorAggregate, \Countable
         }
         return $content;
     }
-}
 
-/**
- * shortcut for new JQ().
- * @return \JQ
- */
-function jq()
-{
-    return JQ::jq(\func_get_args());
-}
+    /**
+     * register function
+     * @param string $name
+     * @param callable $func
+     */
+    public static function jq_fn($name = NULL, $func = NULL)
+    {
+        self::init();
+        if (\func_num_args() === 0) {
+            return self::$fn;
+        } elseif (\func_num_args() === 1) {
+            return self::$fn->$name;
+        } elseif (\func_num_args() === 2) {
+            self::$fn->$name = $func;
+        } else {
+            throw new \ErrorException("args count should be 0 or 1 or 2");
+        }
+    }
 
-/**
- * get ownerDocument of all node created by \JQ.
- * normally you don't need it, except for some time, for example you want create node yourself.
- * don't append any child to document tree.
- * @return \DOMDocument
- */
-function jq_document()
-{
-    return JQ::jq_document();
-}
+    /**
+     * register function will execute when no method found, just like spl_autoload_register
+     * @param callable $content
+     * @param bool $append prepend to $fn_fallback array or append
+     */
 
-/**
- * equivalent to DOMDocument::createTextNode
- * @param string $text
- * @return \JQ
- */
-function jq_text($text)
-{
-    return JQ::jq_text($text);
-}
+    public static function jq_fn_fallback($func = NULL, $prepend = false)
+    {
+        self::init();
+        if (\func_num_args() === 0) {
+            return self::$fn_fallback;
+        } elseif (\func_num_args() === 1 || \func_num_args() === 2) {
+            if ($prepend) {
+                \array_unshift(self::$fn_fallback, $func);
+            } else {
+                self::$fn_fallback[] = $func;
+            }
+        } else {
+            throw new \ErrorException("args count should be 0 or 1 or 2");
+        }
+    }
 
-/**
- * equivalent to DOMDocument::createComment
- * @param string $text
- * @return \JQ
- */
-function jq_comment($text)
-{
-    return JQ::jq_comment($text);
-}
+    /**
+     * when fn_fallback function return jq_FN_FUNC_NOT_FOUND(), will let next fn_fallback function continue run
+     */
+    public static function jq_FN_FUNC_NOT_FOUND()
+    {
+        return self::$FN_FUNC_NOT_FOUND;
+    }
 
-/**
- * equivalent to DOMDocument::createCDATASection
- * @param string $text
- * @return \JQ
- */
-function jq_cdata($text)
-{
-    return JQ::jq_cdata($text);
-}
+    public function __call($name, $arguments)
+    {
+        if (!isset(self::$fn->$name)) {
+            foreach (self::$fn_fallback as $func) {
+                $args = $arguments;
+                \array_unshift($args, $name);
+                \array_unshift($args, $this);
+                $r = \call_user_func_array($func, $args);
+                if ($r !== self::$FN_FUNC_NOT_FOUND) {
+                    return $r;
+                }
+            }
+            throw new \ErrorException("method $name not found");
+        }
+        \array_unshift($arguments, $this);
+        return \call_user_func_array(self::$fn->$name, $arguments);
+    }
 
-/**
- * create JQ from full html string, new JQ() cannot create full html doc or body element, use this function instead.
- * equivalent to DOMDocument::loadHTML
- * @param string $text full html document string 
- * @return \JQ
- */
-function jq_load_html($full_html_str)
-{
-    return JQ::jq_load_html($full_html_str);
-}
+    public function call($func)
+    {
+        $arguments = \func_get_args();
+        $func = \array_shift($arguments);
+        \array_unshift($arguments, $this);
+        return \call_user_func_array($func, $arguments);
+    }
 
-/**
- * create JQ from full html string, new JQ() cannot create full html doc or body element, use this function instead.
- * equivalent to DOMDocument::loadHTML
- * @param string $path file path or url, will pass to file_get_contents
- * @return \JQ
- */
-function jq_load_html_file($full_html_str)
-{
-    return JQ::jq_load_html_file($full_html_str);
+    public function call_array($func, $arguments)
+    {
+        \array_unshift($arguments, $this);
+        return \call_user_func_array($func, $arguments);
+    }
 }
+JQ::init();
+if (!\defined("JQ_DONT_EXPORT_GLOBAL_FUNCTION") || !\constant("JQ_DONT_EXPORT_GLOBAL_FUNCTION")) {
+    /**
+     * shortcut for new JQ().
+     * @return \JQ
+     */
+    function jq()
+    {
+        return JQ::jq(\func_get_args());
+    }
 
-/**
- * equivalent to DOMDocument::importNode
- * @return \JQ
- */
-function jq_import_node(\DOMNode $node)
-{
-    return JQ::jq_import_node($node);
+    /**
+     * get ownerDocument of all node created by \JQ.
+     * normally you don't need it, except for some time, for example you want create node yourself.
+     * don't append any child to document tree.
+     * @return \DOMDocument
+     */
+    function jq_document()
+    {
+        return JQ::jq_document();
+    }
+
+    /**
+     * register function
+     * @param string $name
+     * @param callable $func
+     */
+    function jq_fn($name = NULL, $func = NULL)
+    {
+        return JQ::jq_fn($name, $func);
+    }
+
+    /**
+     * register function will execute when no method found, just like spl_autoload_register
+     * @param callable $content
+     * @param bool $append prepend to $fn_fallback array or append
+     */
+
+    function jq_fn_fallback($func = NULL, $prepend = false)
+    {
+        return JQ::jq_fn_fallback($func, $prepend);
+    }
+
+    /**
+     * when fn_fallback function return jq_FN_FUNC_NOT_FOUND(), will let next fn_fallback function continue run
+     */
+    function jq_FN_FUNC_NOT_FOUND()
+    {
+        return JQ::jq_FN_FUNC_NOT_FOUND();
+    }
+
+    /**
+     * equivalent to DOMDocument::createTextNode
+     * @param string $text
+     * @return \JQ
+     */
+    function jq_text($text)
+    {
+        return JQ::jq_text($text);
+    }
+
+    /**
+     * equivalent to DOMDocument::createComment
+     * @param string $text
+     * @return \JQ
+     */
+    function jq_comment($text)
+    {
+        return JQ::jq_comment($text);
+    }
+
+    /**
+     * equivalent to DOMDocument::createCDATASection
+     * @param string $text
+     * @return \JQ
+     */
+    function jq_cdata($text)
+    {
+        return JQ::jq_cdata($text);
+    }
+
+    /**
+     * create JQ from full html string, new JQ() cannot create full html doc or body element, use this function instead.
+     * equivalent to DOMDocument::loadHTML
+     * @param string $text full html document string 
+     * @return \JQ
+     */
+    function jq_load_html($full_html_str)
+    {
+        return JQ::jq_load_html($full_html_str);
+    }
+
+    /**
+     * create JQ from full html string, new JQ() cannot create full html doc or body element, use this function instead.
+     * equivalent to DOMDocument::loadHTML
+     * @param string $path file path or url, will pass to file_get_contents
+     * @return \JQ
+     */
+    function jq_load_html_file($full_html_str)
+    {
+        return JQ::jq_load_html_file($full_html_str);
+    }
+
+    /**
+     * equivalent to DOMDocument::importNode
+     * @return \JQ
+     */
+    function jq_import_node(\DOMNode $node)
+    {
+        return JQ::jq_import_node($node);
+    }
+
+    /**
+     * return new JQ() from ob_get_contents().
+     * @param bool $trim remove blank before first '<' and after last '>'
+     * @return \JQ
+     */
+    function jq_ob_get_contents($trim = true)
+    {
+        return JQ::jq_ob_get_contents($trim);
+    }
+
+    /**
+     * return new JQ() from ob_get_contents(), automatic close ob with ob_end_clean().
+     * @param bool $trim remove blank before first '<' and after last '>'
+     * @return \JQ
+     */
+    function jq_ob_end_clean($trim = true)
+    {
+        return JQ::jq_ob_end_clean($trim);
+    }
 }
-
-/**
- * return new JQ() from ob_get_contents().
- * @param bool $trim remove blank before first '<' and after last '>'
- * @return \JQ
- */
-function jq_ob_get_contents($trim = true)
-{
-    return JQ::jq_ob_get_contents($trim);
-}
-
-/**
- * return new JQ() from ob_get_contents(), automatic close ob with ob_end_clean().
- * @param bool $trim remove blank before first '<' and after last '>'
- * @return \JQ
- */
-function jq_ob_end_clean($trim = true)
-{
-    return JQ::jq_ob_end_clean($trim);
-}
-
